@@ -1,6 +1,6 @@
 # OOBE Autopilot Registration Script - Production Version
 # Registers devices in Microsoft Intune Autopilot during SCCM OOBE
-# Version: 3.2 - Fix invisible cursor via WM_SETCURSOR WndProc override (CursorForm)
+# Version: 3.3 - Replace WinForms form with HTA (mshta.exe/Trident) to bypass GDI cursor pipeline
 
 param()
 
@@ -65,428 +65,190 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 #endregion
 
-#region Cursor and Window Management
+#region Window Management (used for progress / result dialogs)
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
-public class CursorHelper {
-    [DllImport("user32.dll")]
-    public static extern int ShowCursor(bool bShow);
-    
-    [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    public static extern IntPtr LoadCursor(IntPtr hInstance, int lpCursorName);
-    
-    [DllImport("user32.dll")]
-    public static extern IntPtr SetCursor(IntPtr hCursor);
-    
-    [DllImport("user32.dll")]
-    public static extern bool SetCursorPos(int X, int Y);
-    
-    // Sets the cursor system-wide (all threads/apps). Takes ownership of hcur;
-    // always pass a CopyIcon() duplicate so the original handle stays valid.
-    [DllImport("user32.dll")]
-    public static extern bool SetSystemCursor(IntPtr hcur, uint id);
-    
-    // Duplicates a cursor/icon handle. Required because SetSystemCursor destroys
-    // the handle it receives, so we must pass a fresh copy each time.
-    [DllImport("user32.dll")]
-    public static extern IntPtr CopyIcon(IntPtr hIcon);
-    
-    // Reloads all system cursors from the registry (HKCU\Control Panel\Cursors).
-    // Clears any invisible/null cursor left by Dell firmware or OOBE init.
-    [DllImport("user32.dll")]
-    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
-    
-    // Injects a synthetic relative mouse-move so the GPU/driver repaints the
-    // cursor sprite immediately after a cursor change.
-    [DllImport("user32.dll")]
-    public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
-    
-    public const int  IDC_ARROW        = 32512;
-    public const int  IDC_HAND         = 32649;
-    public const uint OCR_NORMAL       = 32512;  // System "Normal Select" cursor slot
-    public const uint SPI_SETCURSORS   = 0x0057; // Reload cursor scheme from registry
-    public const uint MOUSEEVENTF_MOVE = 0x0001; // Relative mouse-move input flag
-}
-
 public class WindowHelper {
-    [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr hWnd);
-    
-    [DllImport("user32.dll")]
-    public static extern bool BringWindowToTop(IntPtr hWnd);
-    
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    
-    [DllImport("user32.dll")]
-    public static extern IntPtr SetFocus(IntPtr hWnd);
-    
-    [DllImport("user32.dll")]
-    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-    
-    public const int SW_RESTORE = 9;
-    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-    public const uint SWP_NOMOVE = 0x0002;
-    public const uint SWP_NOSIZE = 0x0001;
-    public const uint SWP_SHOWWINDOW = 0x0040;
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetFocus(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    public const int SW_RESTORE = 9;
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_SHOWWINDOW = 0x0040;
 }
 "@
+#endregion
 
-# CursorForm: Form subclass that intercepts WM_SETCURSOR at the WndProc level.
-# WM_SETCURSOR fires on every mouse move over the window and asks "what cursor
-# to display?" By answering here, we override any NULL cursor that OOBE, Dell
-# drivers, or the .NET runtime may have set - this is the definitive fix.
-Add-Type -ReferencedAssemblies System.Windows.Forms @"
-using System;
-using System.Runtime.InteropServices;
-using System.Windows.Forms;
-
-public class CursorForm : Form {
-    private const int  WM_SETCURSOR = 0x0020;
-    private const int  IDC_ARROW    = 32512;
-    private const uint OCR_NORMAL   = 32512;
-
-    [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    private static extern IntPtr LoadCursor(IntPtr hInstance, int lpCursorName);
-    [DllImport("user32.dll")]
-    private static extern IntPtr SetCursor(IntPtr hCursor);
-    [DllImport("user32.dll")]
-    private static extern bool SetSystemCursor(IntPtr hcur, uint id);
-    [DllImport("user32.dll")]
-    private static extern IntPtr CopyIcon(IntPtr hIcon);
-
-    // Cached arrow cursor handle - loaded once, reused on every WM_SETCURSOR.
-    private IntPtr _hArrow;
-
-    public CursorForm() {
-        _hArrow = LoadCursor(IntPtr.Zero, IDC_ARROW);
-    }
-
-    protected override void WndProc(ref Message m) {
-        base.WndProc(ref m);
-        if (m.Msg == WM_SETCURSOR && _hArrow != IntPtr.Zero) {
-            // Force thread-local cursor (visible within this window).
-            SetCursor(_hArrow);
-            // Also update OCR_NORMAL so the hardware cursor overlay (used on
-            // physical displays) shows the arrow. CopyIcon is required because
-            // SetSystemCursor takes ownership of the handle it receives.
-            IntPtr copy = CopyIcon(_hArrow);
-            if (copy != IntPtr.Zero) { SetSystemCursor(copy, OCR_NORMAL); }
-            m.Result = (IntPtr)1;
-        }
-    }
-}
-"@
-
-# Wait for input device drivers (Dell HID drivers finish enumeration ~10-15 s into OOBE)
-Write-Log "Waiting 15 seconds for input device initialization..."
-Start-Sleep -Seconds 15
-
-# Comprehensive cursor fix for physical Dell laptops under SCCM OOBE
+#region Agency Selection via HTA
+# All previous Win32 cursor approaches (SetSystemCursor, SPI_SETCURSORS, WM_SETCURSOR
+# WndProc override) confirmed the APIs succeed but the cursor sprite still does not
+# render on physical Dell hardware during OOBE.  Diagnosis: the WinForms/GDI cursor
+# pipeline does not drive the hardware cursor overlay on physical displays in this
+# execution context.
 #
-# Root causes of invisible cursor on Dell hardware:
-#  1. SetCursor is THREAD-LOCAL - has no effect on the system-wide cursor
-#     sprite rendered by the GPU/display driver on physical hardware.
-#  2. ShowCursor maintains a per-process display counter; OOBE often starts
-#     with a large negative value, so 15 blind increments are not enough.
-#  3. Dell firmware/drivers can reset the cursor back to NULL between calls.
-#  4. Without a synthetic mouse move the driver never repaints the cursor sprite.
-#
-# Fix sequence:
-#  A. SystemParametersInfo(SPI_SETCURSORS) - reloads cursor scheme from registry,
-#     clearing any NULL/invisible cursor left by Dell firmware or OOBE.
-#  B. SetSystemCursor(CopyIcon(arrow), OCR_NORMAL) - replaces the system arrow
-#     cursor slot globally (all threads, all processes, persistent).
-#  C. SetCursor - sets thread-local cursor for this WinForms window as well.
-#  D. ShowCursor loop - increments counter until >= 0 (cursor visible),
-#     capped at 32 iterations to avoid runaway loops.
-#  E. mouse_event(MOUSEEVENTF_MOVE) - injects a 1-pixel synthetic move then
-#     reverses it, forcing the driver to repaint the cursor sprite immediately.
+# Fix: replace the WinForms interactive form with an HTA (HTML Application).
+# mshta.exe hosts the Trident (IE) engine - a completely separate rendering stack
+# from WinForms/GDI.  Cursor rendering in HTA is handled by the browser engine and
+# works correctly on physical Dell hardware.
+Write-Log "Preparing HTA agency selection dialog..."
 
-Write-Log "Applying cursor fix for Dell OOBE environment..."
+$htaPath    = "C:\\Windows\\Temp\\AutopilotSelect.hta"
+$resultPath = "C:\\Windows\\Temp\\AutopilotResult.txt"
 
-# A. Reload all system cursors from registry - clears Dell firmware interference
-Write-Log "Step A: Reloading system cursors from registry (SPI_SETCURSORS)..."
-[CursorHelper]::SystemParametersInfo([CursorHelper]::SPI_SETCURSORS, 0, [IntPtr]::Zero, 0) | Out-Null
-
-# B. Load the standard arrow cursor and set it system-wide via SetSystemCursor.
-# SetSystemCursor takes ownership of the handle it receives, so pass a CopyIcon()
-# duplicate; the original $hCursor stays valid for use elsewhere in the script.
-Write-Log "Step B: Setting system-wide cursor (SetSystemCursor + OCR_NORMAL)..."
-$hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
-Write-Log "Cursor handle: $hCursor"
-$hCursorCopy = [CursorHelper]::CopyIcon($hCursor)
-[CursorHelper]::SetSystemCursor($hCursorCopy, [CursorHelper]::OCR_NORMAL) | Out-Null
-Write-Log "Step B: System-wide cursor set (persistent across all threads)"
-
-# C. Thread-local cursor for this WinForms window
-[CursorHelper]::SetCursor($hCursor) | Out-Null
-Write-Log "Step C: Thread-local cursor set"
-
-# D. Fix the ShowCursor display counter.
-# OOBE may start the counter at a large negative value; increment until >= 0.
-$showCount = [CursorHelper]::ShowCursor($true)
-$maxShowIter = 32
-$showIter = 0
-while ($showCount -lt 0 -and $showIter -lt $maxShowIter) {
-    $showCount = [CursorHelper]::ShowCursor($true)
-    $showIter++
-}
-Write-Log "Step D: ShowCursor counter = $showCount (after $showIter increments)"
-
-# E. Inject a synthetic 1-pixel mouse move and immediately reverse it.
-# Forces the display driver to repaint the cursor sprite right now.
-[CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, 1, 0, 0, [IntPtr]::Zero)
-[CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, -1, 0, 0, [IntPtr]::Zero)
-Write-Log "Step E: Synthetic mouse-move injected to trigger cursor repaint"
-
-Write-Log "Cursor fix applied successfully"
-#endregion
-
-#region Create Form
-Write-Log "Creating UI form..."
-
-$form = New-Object CursorForm
-$form.Text = "Microsoft Intune - Autopilot Device Registration"
-$form.Size = New-Object System.Drawing.Size(520, 420)
-$form.StartPosition = "CenterScreen"
-$form.FormBorderStyle = "FixedDialog"
-$form.MaximizeBox = $false
-$form.MinimizeBox = $false
-$form.BackColor = [System.Drawing.Color]::FromArgb(240, 248, 255)
-$form.TopMost = $true
-$form.ShowInTaskbar = $true
-$form.Cursor = [System.Windows.Forms.Cursors]::Arrow
-
-# Cursor maintenance timer
-$cursorTimer = New-Object System.Windows.Forms.Timer
-$cursorTimer.Interval = 200
-# Track tick count so SetSystemCursor fires every ~2 s (10 x 200 ms)
-# rather than every 200 ms, balancing responsiveness vs. driver thrashing.
-$script:cursorTimerTick = 0
-$cursorTimer.Add_Tick({
-    $hCur = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
-    # Thread-local cursor keeps this WinForms window rendering correctly
-    [CursorHelper]::SetCursor($hCur) | Out-Null
-    # Keep ShowCursor display counter non-negative
-    if ([CursorHelper]::ShowCursor($true) -lt 0) {
-        [CursorHelper]::ShowCursor($true) | Out-Null
-    }
-    # Every 10 ticks (~2 s): refresh system-wide cursor to counter Dell driver overrides
-    $script:cursorTimerTick++
-    if ($script:cursorTimerTick -ge 10) {
-        $script:cursorTimerTick = 0
-        $hCurCopy = [CursorHelper]::CopyIcon($hCur)
-        [CursorHelper]::SetSystemCursor($hCurCopy, [CursorHelper]::OCR_NORMAL) | Out-Null
-        [CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, 1, 0, 0, [IntPtr]::Zero)
-        [CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, -1, 0, 0, [IntPtr]::Zero)
-    }
-})
-
-# Window activation on show
-$form.Add_Shown({
-    Start-Sleep -Milliseconds 200
-    
-    # Sound notification
-    try { [System.Console]::Beep(800, 200) } catch { }
-    
-    $hwnd = $form.Handle
-    
-    # Force to foreground
-    [WindowHelper]::ShowWindow($hwnd, [WindowHelper]::SW_RESTORE) | Out-Null
-    [WindowHelper]::SetWindowPos($hwnd, [WindowHelper]::HWND_TOPMOST, 0, 0, 0, 0, 
-        [WindowHelper]::SWP_NOMOVE -bor [WindowHelper]::SWP_NOSIZE -bor [WindowHelper]::SWP_SHOWWINDOW) | Out-Null
-    [WindowHelper]::BringWindowToTop($hwnd) | Out-Null
-    [WindowHelper]::SetForegroundWindow($hwnd) | Out-Null
-    [WindowHelper]::SetFocus($hwnd) | Out-Null
-    
-    # Load cursor and position
-    $hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
-    [CursorHelper]::SetCursor($hCursor) | Out-Null
-    # Re-apply system-wide cursor now that HWND is live; some Dell OOBE drivers
-    # reset OCR_NORMAL when a new top-level window is created.
-    $hCursorCopyShown = [CursorHelper]::CopyIcon($hCursor)
-    [CursorHelper]::SetSystemCursor($hCursorCopyShown, [CursorHelper]::OCR_NORMAL) | Out-Null
-    [CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, 1, 0, 0, [IntPtr]::Zero)
-    [CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, -1, 0, 0, [IntPtr]::Zero)
-    
-    $centerX = $form.Left + ($form.Width / 2)
-    $centerY = $form.Top + ($form.Height / 2)
-    [CursorHelper]::SetCursorPos($centerX, $centerY) | Out-Null
-    
-    $agencyDropdown.Focus()
-    $cursorTimer.Start()
-    
-    Write-Log "Form displayed and activated"
-})
-
-$form.Add_FormClosing({
-    $cursorTimer.Stop()
-    $cursorTimer.Dispose()
-})
-
-# Re-establish focus if clicked
-$form.Add_Click({
-    $hwnd = $form.Handle
-    [WindowHelper]::SetForegroundWindow($hwnd) | Out-Null
-    [WindowHelper]::BringWindowToTop($hwnd) | Out-Null
-    $hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
-    [CursorHelper]::SetCursor($hCursor) | Out-Null
-})
-#endregion
-
-#region Form Controls - Header
-$headerPanel = New-Object System.Windows.Forms.Panel
-$headerPanel.Location = New-Object System.Drawing.Point(0, 0)
-$headerPanel.Size = New-Object System.Drawing.Size(520, 70)
-$headerPanel.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
-$form.Controls.Add($headerPanel)
-
-$titleLabel = New-Object System.Windows.Forms.Label
-$titleLabel.Location = New-Object System.Drawing.Point(25, 15)
-$titleLabel.Size = New-Object System.Drawing.Size(470, 35)
-$titleLabel.Text = "DOL Autopilot Pre-Provisioning"
-$titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
-$titleLabel.ForeColor = [System.Drawing.Color]::White
-$titleLabel.BackColor = [System.Drawing.Color]::Transparent
-$headerPanel.Controls.Add($titleLabel)
-
-$subtitleLabel = New-Object System.Windows.Forms.Label
-$subtitleLabel.Location = New-Object System.Drawing.Point(25, 80)
-$subtitleLabel.Size = New-Object System.Drawing.Size(470, 40)
-$subtitleLabel.Text = "Initial Device Setup - Agency Assignment Required`nKeyboard: Type letter → Alt+R | Mouse: Click to select"
-$subtitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Italic)
-$form.Controls.Add($subtitleLabel)
-#endregion
-
-#region Form Controls - Serial Number
-$serialLabel = New-Object System.Windows.Forms.Label
-$serialLabel.Location = New-Object System.Drawing.Point(35, 125)
-$serialLabel.Size = New-Object System.Drawing.Size(450, 30)
-$serialLabel.Text = "Device Serial Number: $serialNumber"
-$serialLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
-$serialLabel.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
-$serialLabel.BackColor = [System.Drawing.Color]::Transparent
-$form.Controls.Add($serialLabel)
-
-$separatorPanel = New-Object System.Windows.Forms.Panel
-$separatorPanel.Location = New-Object System.Drawing.Point(35, 160)
-$separatorPanel.Size = New-Object System.Drawing.Size(450, 2)
-$separatorPanel.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
-$form.Controls.Add($separatorPanel)
-#endregion
-
-#region Form Controls - Agency Selection
-$agencyLabel = New-Object System.Windows.Forms.Label
-$agencyLabel.Location = New-Object System.Drawing.Point(35, 175)
-$agencyLabel.Size = New-Object System.Drawing.Size(450, 25)
-$agencyLabel.Text = "Select Your Agency: (Type first letter to jump)"
-$agencyLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-$agencyLabel.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 70)
-$agencyLabel.BackColor = [System.Drawing.Color]::Transparent
-$form.Controls.Add($agencyLabel)
-
-$agencyDropdown = New-Object System.Windows.Forms.ComboBox
-$agencyDropdown.Location = New-Object System.Drawing.Point(35, 205)
-$agencyDropdown.Size = New-Object System.Drawing.Size(450, 35)
-$agencyDropdown.DropDownStyle = "DropDownList"
-$agencyDropdown.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-$agencyDropdown.Cursor = [System.Windows.Forms.Cursors]::Arrow
+@($htaPath, $resultPath) | Where-Object { Test-Path $_ } | Remove-Item -Force
 
 $agencies = @(
-   "OCIO","OCFO","OALJ","ARB","ASAM","ASP","BRB","CRC","DBC","SEC","SOL","OCIA",
-   "OSHA","ETA","OASAM","HRC","ILAB","OPA","OSEC","VETS","ODEP","OMBUD","WB","BOC",
-   "MSHA","EBSA","OFCCP","OWCP","OWECA","OWDLH","OWDCM","OWDAO","ECB","EMC",
-   "OWDFE","OWDEE","WHD","TEST","OLMS"
+    "OCIO","OCFO","OALJ","ARB","ASAM","ASP","BRB","CRC","DBC","SEC","SOL","OCIA",
+    "OSHA","ETA","OASAM","HRC","ILAB","OPA","OSEC","VETS","ODEP","OMBUD","WB","BOC",
+    "MSHA","EBSA","OFCCP","OWCP","OWECA","OWDLH","OWDCM","OWDAO","ECB","EMC",
+    "OWDFE","OWDEE","WHD","TEST","OLMS"
 ) | Sort-Object
 
-$agencies += "Other (Enter Below)"
-$agencies | ForEach-Object { $agencyDropdown.Items.Add($_) | Out-Null }
-$agencyDropdown.SelectedIndex = 0
-$form.Controls.Add($agencyDropdown)
+$optionsHtml = ($agencies | ForEach-Object {
+    '<option value="' + $_ + '">' + $_ + '</option>'
+}) -join "`n"
+$optionsHtml += "`n" + '<option value="Other (Enter Below)">Other (Enter Below)</option>'
 
-$customLabel = New-Object System.Windows.Forms.Label
-$customLabel.Location = New-Object System.Drawing.Point(35, 255)
-$customLabel.Size = New-Object System.Drawing.Size(350, 25)
-$customLabel.Text = "Enter Agency Name (if Other):"
-$customLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($customLabel)
+$htaContent = @"
+<html>
+<head>
+<title>Microsoft Intune - Autopilot Device Registration</title>
+<HTA:APPLICATION
+  ID=`"objHTA`"
+  APPLICATIONNAME=`"AutopilotRegister`"
+  SCROLL=`"no`"
+  SINGLEINSTANCE=`"yes`"
+  MAXIMIZEBUTTON=`"no`"
+  MINIMIZEBUTTON=`"no`"
+  SHOWINTASKBAR=`"yes`"
+/>
+<style>
+  *       { font-family:'Segoe UI',Arial,sans-serif; margin:0; padding:0; box-sizing:border-box; }
+  body    { background:#F0F8FF; }
+  #hdr    { background:#0078D4; color:#fff; padding:18px 25px; }
+  #hdr h1 { font-size:20px; font-weight:bold; }
+  #body   { padding:18px 35px 8px; }
+  .serial { color:#0078D4; font-weight:bold; font-size:13px; margin-bottom:6px; }
+  .sep    { border:none; border-top:2px solid #0078D4; margin:8px 0 12px; }
+  label   { display:block; font-weight:bold; font-size:12px; margin-bottom:4px; color:#444; }
+  select, input[type=text] { width:100%; padding:7px 10px; font-size:13px; border:1px solid #bbb; margin-bottom:12px; }
+  input[type=text]:disabled { background:#f5f5f5; color:#999; }
+  #footer { text-align:right; padding:5px 35px 18px; }
+  button  { padding:9px 22px; font-size:13px; font-weight:bold; border-radius:2px; margin-left:8px; cursor:pointer; }
+  #btnReg { background:#0078D4; color:#fff; border:none; }
+  #btnCnl { background:#fff; color:#333; border:1px solid #bbb; }
+</style>
+<script language=`"VBScript`">
+Dim sResultFile
+sResultFile = `"$resultPath`"
 
-$customTextbox = New-Object System.Windows.Forms.TextBox
-$customTextbox.Location = New-Object System.Drawing.Point(35, 285)
-$customTextbox.Size = New-Object System.Drawing.Size(450, 35)
-$customTextbox.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-$customTextbox.Enabled = $false
-$customTextbox.Cursor = [System.Windows.Forms.Cursors]::IBeam
-$form.Controls.Add($customTextbox)
+Sub Window_OnLoad()
+  window.resizeTo 520, 390
+  Dim L, T
+  L = Int((screen.availWidth  - 520) / 2)
+  T = Int((screen.availHeight - 390) / 2)
+  window.moveTo L, T
+  document.getElementById(`"cboAgency`").focus()
+End Sub
 
-$agencyDropdown.Add_SelectedIndexChanged({
-    if ($agencyDropdown.SelectedItem -eq "Other (Enter Below)") {
-        $customTextbox.Enabled = $true
-        $customTextbox.Focus()
-    } else {
-        $customTextbox.Enabled = $false
-        $customTextbox.Text = ""
-    }
-})
-#endregion
+Sub cboAgency_onchange()
+  If document.getElementById(`"cboAgency`").value = `"Other (Enter Below)`" Then
+    document.getElementById(`"txtCustom`").disabled = False
+    document.getElementById(`"txtCustom`").focus()
+  Else
+    document.getElementById(`"txtCustom`").disabled = True
+    document.getElementById(`"txtCustom`").value = `"`"
+  End If
+End Sub
 
-#region Form Controls - Buttons
-$okButton = New-Object System.Windows.Forms.Button
-$okButton.Location = New-Object System.Drawing.Point(290, 340)
-$okButton.Size = New-Object System.Drawing.Size(120, 40)
-$okButton.Text = "&Register Device"
-$okButton.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
-$okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-$okButton.Cursor = [System.Windows.Forms.Cursors]::Hand
-$form.Controls.Add($okButton)
+Sub WriteResult(ByVal txt)
+  Dim fso, f
+  Set fso = CreateObject(`"Scripting.FileSystemObject`")
+  Set f   = fso.CreateTextFile(sResultFile, True)
+  f.Write txt
+  f.Close
+End Sub
 
-$cancelButton = New-Object System.Windows.Forms.Button
-$cancelButton.Location = New-Object System.Drawing.Point(420, 340)
-$cancelButton.Size = New-Object System.Drawing.Size(80, 40)
-$cancelButton.Text = "&Cancel"
-$cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-$cancelButton.Cursor = [System.Windows.Forms.Cursors]::Hand
-$form.Controls.Add($cancelButton)
+Sub btnReg_onclick()
+  Dim agency
+  If document.getElementById(`"cboAgency`").value = `"Other (Enter Below)`" Then
+    agency = Trim(document.getElementById(`"txtCustom`").value)
+    If agency = `"`" Then
+      MsgBox `"You must enter an agency name.`", 48, `"Invalid Input`"
+      Exit Sub
+    End If
+  Else
+    agency = document.getElementById(`"cboAgency`").value
+  End If
+  WriteResult agency
+  window.close()
+End Sub
 
-$form.CancelButton = $cancelButton
-#endregion
+Sub btnCnl_onclick()
+  WriteResult `"__CANCELLED__`"
+  window.close()
+End Sub
+</script>
+</head>
+<body>
+  <div id=`"hdr`">
+    <h1>DOL Autopilot Pre-Provisioning</h1>
+  </div>
+  <div id=`"body`">
+    <p class=`"serial`">Device Serial Number: $serialNumber</p>
+    <p style=`"font-size:12px;color:#555;margin-bottom:6px;`">
+      Initial Device Setup &amp;mdash; Agency Assignment Required<br>
+      Type letter to jump &amp;nbsp;|&amp;nbsp; Alt+R = Register &amp;nbsp;|&amp;nbsp; Alt+C = Cancel
+    </p>
+    <hr class=`"sep`"/>
+    <label for=`"cboAgency`">Select Your Agency:</label>
+    <select id=`"cboAgency`" onchange=`"cboAgency_onchange()`" size=`"1`">
+      $optionsHtml
+    </select>
+    <label for=`"txtCustom`">Enter Agency Name (if Other):</label>
+    <input type=`"text`" id=`"txtCustom`" disabled=`"disabled`" maxlength=`"100`"/>
+  </div>
+  <div id=`"footer`">
+    <button id=`"btnReg`" accesskey=`"r`" onclick=`"btnReg_onclick()`">Register Device</button>
+    <button id=`"btnCnl`" accesskey=`"c`" onclick=`"btnCnl_onclick()`">Cancel</button>
+  </div>
+</body>
+</html>
+"@
 
-#region Show Form
-Write-Log "Displaying agency selection dialog..."
-try {
-    $result = $form.ShowDialog()
-} catch {
-    Write-Log "ERROR: Failed to display dialog: $_"
-    $groupTag = "DOL"
-    $result = [System.Windows.Forms.DialogResult]::OK
-}
+[System.IO.File]::WriteAllText($htaPath, $htaContent, [System.Text.Encoding]::UTF8)
+Write-Log "HTA written: $htaPath"
 
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-    if ($agencyDropdown.SelectedItem -eq "Other (Enter Below)") {
-        if ([string]::IsNullOrWhiteSpace($customTextbox.Text)) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "You must enter an agency name.",
-                "Invalid Input",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning)
-            $form.Dispose()
-            Write-Log "ERROR: No agency name entered"
-            exit 1
-        } else { 
-            $groupTag = $customTextbox.Text.Trim()
-        }
-    } else { 
-        $groupTag = $agencyDropdown.SelectedItem 
-    }
+Write-Log "Launching HTA agency selection dialog (mshta.exe)..."
+try { [System.Console]::Beep(800, 200) } catch { }
+$proc = Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -PassThru
+$proc.WaitForExit()
+Write-Log "HTA dialog closed (exit code: $($proc.ExitCode))"
+
+$groupTag = "DOL"
+if (Test-Path $resultPath) {
+    $raw = [System.IO.File]::ReadAllText($resultPath).Trim()
+    if ($raw -eq "__CANCELLED__" -or [string]::IsNullOrWhiteSpace($raw)) {
+        Write-Log "Dialog cancelled - using default: DOL"
+    } else {
+        $groupTag = $raw
+        Write-Log "Agency selected: $groupTag"
+    }
 } else {
-    Write-Log "Dialog cancelled - using default: DOL"
-    $groupTag = "DOL"
+    Write-Log "WARNING: No result file - using default: DOL"
 }
 
-$form.Dispose()
-Write-Log "Agency selected: $groupTag"
+@($htaPath, $resultPath) | Where-Object { Test-Path $_ } | Remove-Item -Force -ErrorAction SilentlyContinue
 #endregion
 
 #region Progress Window
@@ -615,9 +377,6 @@ try {
             [WindowHelper]::SWP_NOMOVE -bor [WindowHelper]::SWP_NOSIZE -bor [WindowHelper]::SWP_SHOWWINDOW) | Out-Null
         [WindowHelper]::BringWindowToTop($hwnd) | Out-Null
         [WindowHelper]::SetForegroundWindow($hwnd) | Out-Null
-        
-        $hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
-        [CursorHelper]::SetCursor($hCursor) | Out-Null
     })
     
     $iconPanel = New-Object System.Windows.Forms.Panel
@@ -694,9 +453,6 @@ try {
             [WindowHelper]::SWP_NOMOVE -bor [WindowHelper]::SWP_NOSIZE -bor [WindowHelper]::SWP_SHOWWINDOW) | Out-Null
         [WindowHelper]::BringWindowToTop($hwnd) | Out-Null
         [WindowHelper]::SetForegroundWindow($hwnd) | Out-Null
-        
-        $hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
-        [CursorHelper]::SetCursor($hCursor) | Out-Null
     })
     
     $iconPanel = New-Object System.Windows.Forms.Panel
