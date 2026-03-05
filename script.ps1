@@ -1,6 +1,6 @@
 # OOBE Autopilot Registration Script - Production Version
 # Registers devices in Microsoft Intune Autopilot during SCCM OOBE
-# Version: 3.1 - Fix cursor invisibility on physical Dell laptops (SCCM OOBE/SYSTEM context)
+# Version: 3.2 - Fix invisible cursor via WM_SETCURSOR WndProc override (CursorForm)
 
 param()
 
@@ -133,6 +133,52 @@ public class WindowHelper {
 }
 "@
 
+# CursorForm: Form subclass that intercepts WM_SETCURSOR at the WndProc level.
+# WM_SETCURSOR fires on every mouse move over the window and asks "what cursor
+# to display?" By answering here, we override any NULL cursor that OOBE, Dell
+# drivers, or the .NET runtime may have set - this is the definitive fix.
+Add-Type -ReferencedAssemblies System.Windows.Forms @"
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public class CursorForm : Form {
+    private const int  WM_SETCURSOR = 0x0020;
+    private const int  IDC_ARROW    = 32512;
+    private const uint OCR_NORMAL   = 32512;
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr LoadCursor(IntPtr hInstance, int lpCursorName);
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetCursor(IntPtr hCursor);
+    [DllImport("user32.dll")]
+    private static extern bool SetSystemCursor(IntPtr hcur, uint id);
+    [DllImport("user32.dll")]
+    private static extern IntPtr CopyIcon(IntPtr hIcon);
+
+    // Cached arrow cursor handle - loaded once, reused on every WM_SETCURSOR.
+    private IntPtr _hArrow;
+
+    public CursorForm() {
+        _hArrow = LoadCursor(IntPtr.Zero, IDC_ARROW);
+    }
+
+    protected override void WndProc(ref Message m) {
+        base.WndProc(ref m);
+        if (m.Msg == WM_SETCURSOR && _hArrow != IntPtr.Zero) {
+            // Force thread-local cursor (visible within this window).
+            SetCursor(_hArrow);
+            // Also update OCR_NORMAL so the hardware cursor overlay (used on
+            // physical displays) shows the arrow. CopyIcon is required because
+            // SetSystemCursor takes ownership of the handle it receives.
+            IntPtr copy = CopyIcon(_hArrow);
+            if (copy != IntPtr.Zero) { SetSystemCursor(copy, OCR_NORMAL); }
+            m.Result = (IntPtr)1;
+        }
+    }
+}
+"@
+
 # Wait for input device drivers (Dell HID drivers finish enumeration ~10-15 s into OOBE)
 Write-Log "Waiting 15 seconds for input device initialization..."
 Start-Sleep -Seconds 15
@@ -201,7 +247,7 @@ Write-Log "Cursor fix applied successfully"
 #region Create Form
 Write-Log "Creating UI form..."
 
-$form = New-Object System.Windows.Forms.Form
+$form = New-Object CursorForm
 $form.Text = "Microsoft Intune - Autopilot Device Registration"
 $form.Size = New-Object System.Drawing.Size(520, 420)
 $form.StartPosition = "CenterScreen"
@@ -258,6 +304,12 @@ $form.Add_Shown({
     # Load cursor and position
     $hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
     [CursorHelper]::SetCursor($hCursor) | Out-Null
+    # Re-apply system-wide cursor now that HWND is live; some Dell OOBE drivers
+    # reset OCR_NORMAL when a new top-level window is created.
+    $hCursorCopyShown = [CursorHelper]::CopyIcon($hCursor)
+    [CursorHelper]::SetSystemCursor($hCursorCopyShown, [CursorHelper]::OCR_NORMAL) | Out-Null
+    [CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, 1, 0, 0, [IntPtr]::Zero)
+    [CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, -1, 0, 0, [IntPtr]::Zero)
     
     $centerX = $form.Left + ($form.Width / 2)
     $centerY = $form.Top + ($form.Height / 2)
