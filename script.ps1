@@ -1,6 +1,6 @@
 # OOBE Autopilot Registration Script - Production Version
 # Registers devices in Microsoft Intune Autopilot during SCCM OOBE
-# Version: 3.0 Final
+# Version: 3.1 - Fix cursor invisibility on physical Dell laptops (SCCM OOBE/SYSTEM context)
 
 param()
 
@@ -82,8 +82,31 @@ public class CursorHelper {
     [DllImport("user32.dll")]
     public static extern bool SetCursorPos(int X, int Y);
     
-    public const int IDC_ARROW = 32512;
-    public const int IDC_HAND = 32649;
+    // Sets the cursor system-wide (all threads/apps). Takes ownership of hcur;
+    // always pass a CopyIcon() duplicate so the original handle stays valid.
+    [DllImport("user32.dll")]
+    public static extern bool SetSystemCursor(IntPtr hcur, uint id);
+    
+    // Duplicates a cursor/icon handle. Required because SetSystemCursor destroys
+    // the handle it receives, so we must pass a fresh copy each time.
+    [DllImport("user32.dll")]
+    public static extern IntPtr CopyIcon(IntPtr hIcon);
+    
+    // Reloads all system cursors from the registry (HKCU\Control Panel\Cursors).
+    // Clears any invisible/null cursor left by Dell firmware or OOBE init.
+    [DllImport("user32.dll")]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+    
+    // Injects a synthetic relative mouse-move so the GPU/driver repaints the
+    // cursor sprite immediately after a cursor change.
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
+    
+    public const int  IDC_ARROW        = 32512;
+    public const int  IDC_HAND         = 32649;
+    public const uint OCR_NORMAL       = 32512;  // System "Normal Select" cursor slot
+    public const uint SPI_SETCURSORS   = 0x0057; // Reload cursor scheme from registry
+    public const uint MOUSEEVENTF_MOVE = 0x0001; // Relative mouse-move input flag
 }
 
 public class WindowHelper {
@@ -110,21 +133,69 @@ public class WindowHelper {
 }
 "@
 
-# Wait for input device drivers
+# Wait for input device drivers (Dell HID drivers finish enumeration ~10-15 s into OOBE)
 Write-Log "Waiting 15 seconds for input device initialization..."
 Start-Sleep -Seconds 15
 
-# Load and set cursor graphic
-Write-Log "Loading cursor graphic..."
-$hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
-[CursorHelper]::SetCursor($hCursor) | Out-Null
-Write-Log "Cursor loaded: $hCursor"
+# Comprehensive cursor fix for physical Dell laptops under SCCM OOBE
+#
+# Root causes of invisible cursor on Dell hardware:
+#  1. SetCursor is THREAD-LOCAL - has no effect on the system-wide cursor
+#     sprite rendered by the GPU/display driver on physical hardware.
+#  2. ShowCursor maintains a per-process display counter; OOBE often starts
+#     with a large negative value, so 15 blind increments are not enough.
+#  3. Dell firmware/drivers can reset the cursor back to NULL between calls.
+#  4. Without a synthetic mouse move the driver never repaints the cursor sprite.
+#
+# Fix sequence:
+#  A. SystemParametersInfo(SPI_SETCURSORS) - reloads cursor scheme from registry,
+#     clearing any NULL/invisible cursor left by Dell firmware or OOBE.
+#  B. SetSystemCursor(CopyIcon(arrow), OCR_NORMAL) - replaces the system arrow
+#     cursor slot globally (all threads, all processes, persistent).
+#  C. SetCursor - sets thread-local cursor for this WinForms window as well.
+#  D. ShowCursor loop - increments counter until >= 0 (cursor visible),
+#     capped at 32 iterations to avoid runaway loops.
+#  E. mouse_event(MOUSEEVENTF_MOVE) - injects a 1-pixel synthetic move then
+#     reverses it, forcing the driver to repaint the cursor sprite immediately.
 
-# Ensure cursor visibility
-for ($i = 0; $i -lt 15; $i++) {
-    [CursorHelper]::ShowCursor($true) | Out-Null
+Write-Log "Applying cursor fix for Dell OOBE environment..."
+
+# A. Reload all system cursors from registry - clears Dell firmware interference
+Write-Log "Step A: Reloading system cursors from registry (SPI_SETCURSORS)..."
+[CursorHelper]::SystemParametersInfo([CursorHelper]::SPI_SETCURSORS, 0, [IntPtr]::Zero, 0) | Out-Null
+
+# B. Load the standard arrow cursor and set it system-wide via SetSystemCursor.
+# SetSystemCursor takes ownership of the handle it receives, so pass a CopyIcon()
+# duplicate; the original $hCursor stays valid for use elsewhere in the script.
+Write-Log "Step B: Setting system-wide cursor (SetSystemCursor + OCR_NORMAL)..."
+$hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
+Write-Log "Cursor handle: $hCursor"
+$hCursorCopy = [CursorHelper]::CopyIcon($hCursor)
+[CursorHelper]::SetSystemCursor($hCursorCopy, [CursorHelper]::OCR_NORMAL) | Out-Null
+Write-Log "Step B: System-wide cursor set (persistent across all threads)"
+
+# C. Thread-local cursor for this WinForms window
+[CursorHelper]::SetCursor($hCursor) | Out-Null
+Write-Log "Step C: Thread-local cursor set"
+
+# D. Fix the ShowCursor display counter.
+# OOBE may start the counter at a large negative value; increment until >= 0.
+$showCount = [CursorHelper]::ShowCursor($true)
+$maxShowIter = 32
+$showIter = 0
+while ($showCount -lt 0 -and $showIter -lt $maxShowIter) {
+    $showCount = [CursorHelper]::ShowCursor($true)
+    $showIter++
 }
-Write-Log "Cursor visibility ensured"
+Write-Log "Step D: ShowCursor counter = $showCount (after $showIter increments)"
+
+# E. Inject a synthetic 1-pixel mouse move and immediately reverse it.
+# Forces the display driver to repaint the cursor sprite right now.
+[CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, 1, 0, 0, [IntPtr]::Zero)
+[CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, -1, 0, 0, [IntPtr]::Zero)
+Write-Log "Step E: Synthetic mouse-move injected to trigger cursor repaint"
+
+Write-Log "Cursor fix applied successfully"
 #endregion
 
 #region Create Form
@@ -145,10 +216,26 @@ $form.Cursor = [System.Windows.Forms.Cursors]::Arrow
 # Cursor maintenance timer
 $cursorTimer = New-Object System.Windows.Forms.Timer
 $cursorTimer.Interval = 200
+# Track tick count so SetSystemCursor fires every ~2 s (10 x 200 ms)
+# rather than every 200 ms, balancing responsiveness vs. driver thrashing.
+$script:cursorTimerTick = 0
 $cursorTimer.Add_Tick({
-    $hCursor = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
-    [CursorHelper]::SetCursor($hCursor) | Out-Null
-    [CursorHelper]::ShowCursor($true) | Out-Null
+    $hCur = [CursorHelper]::LoadCursor([IntPtr]::Zero, [CursorHelper]::IDC_ARROW)
+    # Thread-local cursor keeps this WinForms window rendering correctly
+    [CursorHelper]::SetCursor($hCur) | Out-Null
+    # Keep ShowCursor display counter non-negative
+    if ([CursorHelper]::ShowCursor($true) -lt 0) {
+        [CursorHelper]::ShowCursor($true) | Out-Null
+    }
+    # Every 10 ticks (~2 s): refresh system-wide cursor to counter Dell driver overrides
+    $script:cursorTimerTick++
+    if ($script:cursorTimerTick -ge 10) {
+        $script:cursorTimerTick = 0
+        $hCurCopy = [CursorHelper]::CopyIcon($hCur)
+        [CursorHelper]::SetSystemCursor($hCurCopy, [CursorHelper]::OCR_NORMAL) | Out-Null
+        [CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, 1, 0, 0, [IntPtr]::Zero)
+        [CursorHelper]::mouse_event([CursorHelper]::MOUSEEVENTF_MOVE, -1, 0, 0, [IntPtr]::Zero)
+    }
 })
 
 # Window activation on show
