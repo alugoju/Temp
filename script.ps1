@@ -318,8 +318,18 @@ Write-Log "Cursor fix applied (ShowCursor counter=$sc after $scIter increments)"
 Write-Log "Preparing HTA agency selection dialog..."
 Write-Log "env:TEMP resolved to: $env:TEMP"
 
-$htaPath    = Join-Path $env:TEMP "AutopilotSelect.hta"
-$resultPath = Join-Path $env:TEMP "AutopilotResult.txt"
+# Expand $env:TEMP to its full long path before use.
+# On corporate machines with long usernames, $env:TEMP can resolve to a DOS 8.3
+# short path (e.g. Z-ALUG~1.ENT instead of z-Alugoju-Narasimha.ENT).
+# VBScript's FileSystemObject cannot write to paths containing tilde short names
+# and silently fails - no result file is written and the HTA throws a Script Error.
+# GetFullPath() resolves the drive-relative path; (Get-Item).FullName then expands
+# any remaining 8.3 components to their full Unicode long path equivalents.
+$tempLong   = (Get-Item -LiteralPath ([System.IO.Path]::GetFullPath($env:TEMP))).FullName
+Write-Log "env:TEMP long path  : $tempLong"
+
+$htaPath    = Join-Path $tempLong "AutopilotSelect.hta"
+$resultPath = Join-Path $tempLong "AutopilotResult.txt"
 
 Write-Log "HTA path    : $htaPath"
 Write-Log "Result path : $resultPath"
