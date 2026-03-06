@@ -11,7 +11,6 @@
 # Exit codes:
 #   0  = Success (device registered, task sequence can continue)
 #   1  = Failure (network timeout, auth failure, registration error, etc.)
-#   2  = Cancelled by user with no fallback (soft-fail, TS step can be set to continue)
 
 param()
 
@@ -192,7 +191,7 @@ if (-not $networkReady) {
 #endregion
 
 #region Device Information
-$serialNumber = (Get-WmiObject -Class Win32_BIOS).SerialNumber
+$serialNumber = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
 Write-Log "Device Serial: $serialNumber"
 
 # Use OSDComputerName from TS if available, otherwise use the actual hostname
