@@ -328,6 +328,30 @@ Write-Log "env:TEMP resolved to: $env:TEMP"
 $tempLong   = (Get-Item -LiteralPath ([System.IO.Path]::GetFullPath($env:TEMP))).FullName
 Write-Log "env:TEMP long path  : $tempLong"
 
+# WHY THE HTA ENDS UP AT C:\Windows\Temp:
+# When ServiceUI.exe does NOT successfully inherit the interactive user's environment
+# (e.g. the TS step runs before a user session is fully established, or ServiceUI
+# finds tsprogressui.exe in Session 0), the spawned PowerShell process keeps the
+# SYSTEM account's environment where $env:TEMP = C:\Windows\Temp.
+# In that case the enterprise filter driver intercepts mshta.exe's file read and
+# injects BOM bytes (our write-time BOM check passes because ReadAllBytes also
+# goes through the driver cache, but a fresh open by mshta.exe sees the modified
+# file).
+#
+# FIX: if $env:TEMP resolved to the Windows system temp, fall back to
+# C:\ProgramData\AutopilotTemp which is writable by SYSTEM, has a full long path,
+# and is typically outside the GP/AV filter scope that targets Temp directories.
+$systemTempCanon = (Get-Item -LiteralPath ([System.IO.Path]::GetFullPath("$env:SystemRoot\Temp"))).FullName
+if ($tempLong -ieq $systemTempCanon) {
+    Write-Log "WARNING: env:TEMP resolved to system temp ($tempLong) - filter driver interception likely."
+    Write-Log "         Falling back to C:\ProgramData\AutopilotTemp to bypass GP/AV temp-dir filtering."
+    $tempLong = Join-Path $env:ProgramData "AutopilotTemp"
+    if (-not (Test-Path -LiteralPath $tempLong)) {
+        New-Item -ItemType Directory -Path $tempLong -Force | Out-Null
+    }
+    Write-Log "Fallback path used : $tempLong"
+}
+
 $htaPath    = Join-Path $tempLong "AutopilotSelect.hta"
 $resultPath = Join-Path $tempLong "AutopilotResult.txt"
 
@@ -479,6 +503,48 @@ if ($hasBom) {
     exit 1
 }
 Write-Log "BOM verification: PASS (byte[0]=0x$($verifyBytes[0].ToString('X2')) -- no BOM)"
+
+# -----------------------------------------------------------------------
+# DIAGNOSTIC BLOCK - answers:
+#   Q1. What path did we actually write to?  (already logged above as HTA path)
+#   Q2. What is on lines 40 and 147 of the generated HTA?
+#   Q3. Could backslashes in $resultPath corrupt the VBScript sResultFile line?
+# -----------------------------------------------------------------------
+
+# First 10 bytes as hex - confirms no BOM and shows actual file start
+$hexDump = ($verifyBytes | Select-Object -First 10 |
+            ForEach-Object { '0x{0:X2}' -f $_ }) -join ' '
+Write-Log "First 10 bytes (hex): $hexDump"
+
+# Split on CRLF to get line array; report total and pinpoint error lines 40 and 147
+# (Trident reports errors at the line number within the *file*, not within the script block)
+$htaLineArray = $htaContent -split "`r`n"
+Write-Log "HTA total lines: $($htaLineArray.Count)"
+foreach ($diagLine in 40, 147) {
+    if ($diagLine -le $htaLineArray.Count) {
+        Write-Log ("HTA line {0,3}: {1}" -f $diagLine, $htaLineArray[$diagLine - 1])
+    } else {
+        Write-Log ("HTA line {0,3}: (beyond end - file has only {1} lines)" -f $diagLine, $htaLineArray.Count)
+    }
+}
+
+# Q3 - Backslash answer: log the exact sResultFile assignment as it will appear in VBScript.
+# VBScript does NOT use backslash as an escape character, so single backslashes are correct.
+# Curly/smart quotes or non-ASCII chars in $resultPath would cause "Invalid character".
+$vbsResultLine = 'sResultFile = "' + $resultPath + '"'
+Write-Log "VBScript sResultFile line: $vbsResultLine"
+$nonAscii = ($resultPath.ToCharArray() | Where-Object { [int]$_ -gt 127 })
+if ($nonAscii) {
+    Write-Log "WARNING: resultPath contains non-ASCII characters: $($nonAscii -join ',')"
+} else {
+    Write-Log "resultPath is pure ASCII - backslashes and path are valid for VBScript FSO"
+}
+
+# Write a plain-text debug copy of the HTA content so it can be inspected directly
+# on the machine (open with Notepad to see exact content including any injected bytes)
+$debugPath = Join-Path $tempLong "AutopilotSelect.debug.txt"
+[System.IO.File]::WriteAllBytes($debugPath, $htaBytes)
+Write-Log "Debug copy written: $debugPath  (identical bytes to the HTA - open in Notepad to inspect)"
 
 # Launch HTA - mshta.exe is projected into Session 1 by ServiceUI.exe
 Write-Log "Launching mshta.exe for agency selection..."
